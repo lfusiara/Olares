@@ -1,0 +1,143 @@
+#!/usr/bin/env bash
+
+set -Eeuo pipefail
+if [[ -n "${OLARES_TOOLBOX_LIB_DIR:-}" ]]; then
+  LIB_DIR="$OLARES_TOOLBOX_LIB_DIR"
+elif [[ -f "$HOME/.local/lib/olares-toolbox/codex-targets.sh" ]]; then
+  LIB_DIR="$HOME/.local/lib/olares-toolbox"
+else
+  LIB_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/../lib" && pwd -P)"
+fi
+source "$LIB_DIR/codex-targets.sh"
+
+STATE_DIR="${OLARES_HA_FORWARD_STATE_DIR:-$HOME/.local/state/olares-ha-port-forward}"
+PID_FILE="$STATE_DIR/worker.pid"
+TARGET_FILE="$STATE_DIR/target"
+LOG_FILE="$STATE_DIR/port-forward.log"
+RETRY_SECONDS="${OLARES_HA_FORWARD_RETRY_SECONDS:-5}"
+DEFAULT_PORTS=(8123:8123 1883:1883 8099:8099 8100:8100)
+mkdir -p "$STATE_DIR"
+
+is_running() {
+  [[ -s "$PID_FILE" ]] && kill -0 "$(cat "$PID_FILE")" 2>/dev/null
+}
+
+worker() {
+  shift
+  namespace="$1"
+  deployment="$2"
+  shift 2
+  ports=("$@")
+  ((${#ports[@]} > 0)) || ports=("${DEFAULT_PORTS[@]}")
+  child_pid=""
+  cleanup() {
+    [[ -n "$child_pid" ]] && kill "$child_pid" 2>/dev/null || true
+    rm -f "$PID_FILE"
+  }
+  trap cleanup EXIT
+  trap 'cleanup; exit 0' INT TERM
+
+  while true; do
+    printf '%s Port-forward %s/%s: %s\n' \
+      "$(date --iso-8601=seconds)" "$namespace" "$deployment" "${ports[*]}"
+    kubectl -n "$namespace" port-forward --address=0.0.0.0 \
+      "deployment/$deployment" "${ports[@]}" &
+    child_pid=$!
+    wait "$child_pid" || true
+    child_pid=""
+    printf '%s Ponawianie za %s s.\n' "$(date --iso-8601=seconds)" "$RETRY_SECONDS"
+    sleep "$RETRY_SECONDS"
+  done
+}
+
+parse_target_and_ports() {
+  requested_namespace=""
+  requested_deployment=""
+  ports=()
+  while (($# > 0)); do
+    case "$1" in
+      --namespace)
+        (($# >= 2)) || { printf 'ERROR: Brak wartosci --namespace.\n' >&2; exit 2; }
+        requested_namespace="$2"
+        shift 2
+        ;;
+      --deployment)
+        (($# >= 2)) || { printf 'ERROR: Brak wartosci --deployment.\n' >&2; exit 2; }
+        requested_deployment="$2"
+        shift 2
+        ;;
+      *)
+        [[ "$1" =~ ^[0-9]+:[0-9]+$ ]] || {
+          printf 'ERROR: Nieprawidlowe mapowanie portu: %s.\n' "$1" >&2
+          exit 2
+        }
+        ports+=("$1")
+        shift
+        ;;
+    esac
+  done
+  select_codex_target "$requested_namespace" "$requested_deployment"
+}
+
+case "${1:-start}" in
+  --worker)
+    worker "$@"
+    ;;
+  list)
+    print_codex_targets
+    ;;
+  start)
+    shift || true
+    command -v kubectl >/dev/null 2>&1 || {
+      printf 'ERROR: Brak kubectl. Polecenie uruchamiaj na hoscie Olares.\n' >&2
+      exit 1
+    }
+    if is_running; then
+      printf 'Port-forward juz dziala jako PID %s dla %s.\n' \
+        "$(cat "$PID_FILE")" "$(cat "$TARGET_FILE" 2>/dev/null || printf '?')"
+      exit 0
+    fi
+    parse_target_and_ports "$@"
+    printf '%s/%s\n' "$CODEX_NAMESPACE" "$CODEX_DEPLOYMENT" >"$TARGET_FILE"
+    nohup "$0" --worker "$CODEX_NAMESPACE" "$CODEX_DEPLOYMENT" "${ports[@]}" \
+      >>"$LOG_FILE" 2>&1 &
+    worker_pid=$!
+    printf '%s\n' "$worker_pid" >"$PID_FILE"
+    sleep 1
+    kill -0 "$worker_pid" 2>/dev/null || {
+      printf 'ERROR: Worker nie wystartowal. Sprawdz %s.\n' "$LOG_FILE" >&2
+      exit 1
+    }
+    printf 'Port-forward dla %s/%s dziala w tle jako PID %s.\n' \
+      "$CODEX_NAMESPACE" "$CODEX_DEPLOYMENT" "$worker_pid"
+    ;;
+  stop)
+    if ! is_running; then
+      rm -f "$PID_FILE"
+      printf 'Port-forward nie dziala.\n'
+      exit 0
+    fi
+    worker_pid="$(cat "$PID_FILE")"
+    kill "$worker_pid"
+    for _ in $(seq 1 20); do
+      kill -0 "$worker_pid" 2>/dev/null || break
+      sleep 0.25
+    done
+    rm -f "$PID_FILE"
+    printf 'Port-forward zatrzymany.\n'
+    ;;
+  status)
+    is_running || { printf 'Port-forward nie dziala.\n'; exit 1; }
+    printf 'Port-forward dziala jako PID %s dla %s.\n' \
+      "$(cat "$PID_FILE")" "$(cat "$TARGET_FILE" 2>/dev/null || printf '?')"
+    ;;
+  logs)
+    touch "$LOG_FILE"
+    exec tail -n 100 -f "$LOG_FILE"
+    ;;
+  *)
+    printf 'Uzycie: %s {list|start [--namespace NS] [--deployment NAME] [PORT:PORT...]|stop|status|logs}\n' \
+      "$0" >&2
+    exit 2
+    ;;
+esac

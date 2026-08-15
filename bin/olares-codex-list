@@ -1,0 +1,17 @@
+#!/usr/bin/env bash
+
+set -Eeuo pipefail
+if [[ -n "${OLARES_TOOLBOX_LIB_DIR:-}" ]]; then
+  LIB_DIR="$OLARES_TOOLBOX_LIB_DIR"
+elif [[ -f "$HOME/.local/lib/olares-toolbox/codex-targets.sh" ]]; then
+  LIB_DIR="$HOME/.local/lib/olares-toolbox"
+else
+  LIB_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/../lib" && pwd -P)"
+fi
+source "$LIB_DIR/codex-targets.sh"
+
+command -v kubectl >/dev/null 2>&1 || {
+  printf 'ERROR: Brak kubectl. Polecenie uruchamiaj na hoscie Olares.\n' >&2
+  exit 1
+}
+print_codex_targets

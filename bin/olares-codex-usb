@@ -1,0 +1,152 @@
+#!/usr/bin/env bash
+
+set -Eeuo pipefail
+if [[ -n "${OLARES_TOOLBOX_LIB_DIR:-}" ]]; then
+  LIB_DIR="$OLARES_TOOLBOX_LIB_DIR"
+elif [[ -f "$HOME/.local/lib/olares-toolbox/codex-targets.sh" ]]; then
+  LIB_DIR="$HOME/.local/lib/olares-toolbox"
+else
+  LIB_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/../lib" && pwd -P)"
+fi
+source "$LIB_DIR/codex-targets.sh"
+
+usage() {
+  cat >&2 <<'EOF'
+Uzycie:
+  olares-codex-usb list
+  olares-codex-usb status [--namespace NS] [--deployment NAME]
+  olares-codex-usb apply [--namespace NS] [--deployment NAME] [--device /dev/ttyACM0] [--yes]
+
+apply modyfikuje Deployment wybranej aplikacji Codex CLI i powoduje odtworzenie
+poda. Przed zapisem pokazuje cel i wymaga potwierdzenia, chyba ze podano --yes.
+EOF
+  exit "${1:-2}"
+}
+
+command -v kubectl >/dev/null 2>&1 || {
+  printf 'ERROR: Brak kubectl. Polecenie uruchamiaj na hoscie Olares.\n' >&2
+  exit 1
+}
+
+action="${1:-}"
+[[ -n "$action" ]] || usage
+shift
+requested_namespace=""
+requested_deployment=""
+device="/dev/ttyACM0"
+assume_yes=false
+while (($# > 0)); do
+  case "$1" in
+    --namespace)
+      (($# >= 2)) || usage
+      requested_namespace="$2"
+      shift 2
+      ;;
+    --deployment)
+      (($# >= 2)) || usage
+      requested_deployment="$2"
+      shift 2
+      ;;
+    --device)
+      (($# >= 2)) || usage
+      device="$2"
+      shift 2
+      ;;
+    --yes)
+      assume_yes=true
+      shift
+      ;;
+    -h|--help)
+      usage 0
+      ;;
+    *)
+      usage
+      ;;
+  esac
+done
+
+case "$action" in
+  list)
+    [[ -z "$requested_namespace" && -z "$requested_deployment" && "$assume_yes" == false ]] || usage
+    print_codex_targets
+    exit 0
+    ;;
+  status|apply) ;;
+  *) usage ;;
+esac
+
+[[ "$device" =~ ^/dev/tty(ACM|USB)[0-9]+$ ]] || {
+  printf 'ERROR: Nieobslugiwana sciezka urzadzenia: %s.\n' "$device" >&2
+  exit 1
+}
+select_codex_target "$requested_namespace" "$requested_deployment"
+
+container_names="$(kubectl -n "$CODEX_NAMESPACE" get deploy "$CODEX_DEPLOYMENT" \
+  -o jsonpath='{range .spec.template.spec.containers[*]}{.name}{"\n"}{end}')"
+grep -Fqx docker-dind <<<"$container_names" || {
+  printf 'ERROR: Deployment %s/%s nie ma kontenera docker-dind. Kontenery:\n%s\n' \
+    "$CODEX_NAMESPACE" "$CODEX_DEPLOYMENT" "$container_names" >&2
+  exit 1
+}
+
+if [[ "$action" == status ]]; then
+  printf 'Cel: namespace=%s deployment=%s container=docker-dind\n' \
+    "$CODEX_NAMESPACE" "$CODEX_DEPLOYMENT"
+  kubectl -n "$CODEX_NAMESPACE" get deploy "$CODEX_DEPLOYMENT" \
+    -o jsonpath='{range .spec.template.spec.containers[?(@.name=="docker-dind")].volumeMounts[*]}{.name}{" -> "}{.mountPath}{"\n"}{end}'
+  exit 0
+fi
+
+[[ -c "$device" ]] || {
+  printf 'ERROR: %s nie istnieje albo nie jest urzadzeniem znakowym.\n' "$device" >&2
+  exit 1
+}
+[[ -d /dev/serial/by-id ]] || {
+  printf 'ERROR: Brak katalogu /dev/serial/by-id na hoscie Olares.\n' >&2
+  exit 1
+}
+
+printf 'Zostanie zmodyfikowany Deployment:\n'
+printf '  namespace:  %s\n' "$CODEX_NAMESPACE"
+printf '  deployment: %s\n' "$CODEX_DEPLOYMENT"
+printf '  container:  docker-dind\n'
+printf '  device:     %s\n' "$device"
+printf '  directory:  /dev/serial/by-id (read-only)\n'
+printf 'Pod Codex CLI zostanie odtworzony.\n'
+
+if [[ "$assume_yes" == false ]]; then
+  [[ -t 0 ]] || { printf 'ERROR: Tryb nieinteraktywny wymaga --yes.\n' >&2; exit 1; }
+  read -r -p 'Zastosowac konfiguracje USB? [y/N] ' answer
+  [[ "$answer" =~ ^[Yy]$ ]] || exit 0
+fi
+
+patch_file="$(mktemp)"
+trap 'rm -f "$patch_file"' EXIT
+cat >"$patch_file" <<EOF
+spec:
+  template:
+    spec:
+      volumes:
+        - name: olares-usb-panel-device
+          hostPath:
+            path: $device
+            type: CharDevice
+        - name: olares-usb-serial-by-id
+          hostPath:
+            path: /dev/serial/by-id
+            type: Directory
+      containers:
+        - name: docker-dind
+          volumeMounts:
+            - name: olares-usb-panel-device
+              mountPath: $device
+            - name: olares-usb-serial-by-id
+              mountPath: /dev/serial/by-id
+              readOnly: true
+EOF
+
+kubectl -n "$CODEX_NAMESPACE" patch deployment "$CODEX_DEPLOYMENT" \
+  --type=strategic --patch-file "$patch_file"
+kubectl -n "$CODEX_NAMESPACE" rollout status deployment "$CODEX_DEPLOYMENT" \
+  --timeout=5m
+printf 'USB skonfigurowane. W terminalu Codex CLI sprawdz Docker-in-Docker.\n'
