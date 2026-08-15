@@ -11,12 +11,80 @@ fi
 source "$LIB_DIR/codex-targets.sh"
 
 STATE_DIR="${OLARES_HA_FORWARD_STATE_DIR:-$HOME/.local/state/olares-ha-port-forward}"
+CONFIG_DIR="${OLARES_TOOLBOX_CONFIG_DIR:-$HOME/.config/olares-toolbox}"
+CONFIG_FILE="$CONFIG_DIR/port-forward.conf"
 PID_FILE="$STATE_DIR/worker.pid"
 TARGET_FILE="$STATE_DIR/target"
 LOG_FILE="$STATE_DIR/port-forward.log"
 RETRY_SECONDS="${OLARES_HA_FORWARD_RETRY_SECONDS:-5}"
 DEFAULT_PORTS=(8123:8123 1883:1883 8099:8099 8100:8100)
 mkdir -p "$STATE_DIR"
+
+load_configured_ports() {
+  configured_ports=()
+  [[ -f "$CONFIG_FILE" ]] || return 1
+  while IFS=$'\t' read -r config_namespace config_deployment config_ports; do
+    [[ "$config_namespace" == "$1" && "$config_deployment" == "$2" ]] || continue
+    read -r -a configured_ports <<<"$config_ports"
+    return 0
+  done <"$CONFIG_FILE"
+  return 1
+}
+
+list_configurations() {
+  if [[ ! -s "$CONFIG_FILE" ]]; then
+    printf 'Brak zapisanych konfiguracji w %s.\n' "$CONFIG_FILE"
+    return 0
+  fi
+  printf 'Zapisane konfiguracje port-forward:\n'
+  while IFS=$'\t' read -r config_namespace config_deployment config_ports; do
+    printf '  namespace=%s deployment=%s ports=%s\n' \
+      "$config_namespace" "$config_deployment" "$config_ports"
+  done <"$CONFIG_FILE"
+}
+
+save_configuration() {
+  namespace="$1"
+  deployment="$2"
+  shift 2
+  mkdir -p "$CONFIG_DIR"
+  temp_file="$(mktemp "$CONFIG_DIR/port-forward.conf.XXXXXX")"
+  if [[ -f "$CONFIG_FILE" ]]; then
+    while IFS=$'\t' read -r config_namespace config_deployment config_ports; do
+      [[ "$config_namespace" == "$namespace" && "$config_deployment" == "$deployment" ]] && continue
+      printf '%s\t%s\t%s\n' "$config_namespace" "$config_deployment" "$config_ports" >>"$temp_file"
+    done <"$CONFIG_FILE"
+  fi
+  printf '%s\t%s\t%s\n' "$namespace" "$deployment" "$*" >>"$temp_file"
+  chmod 0600 "$temp_file"
+  mv -f "$temp_file" "$CONFIG_FILE"
+  printf 'Zapisano porty dla %s/%s: %s\n' "$namespace" "$deployment" "$*"
+}
+
+remove_configuration() {
+  namespace="$1"
+  deployment="$2"
+  [[ -f "$CONFIG_FILE" ]] || {
+    printf 'Brak zapisanej konfiguracji dla %s/%s.\n' "$namespace" "$deployment"
+    return 0
+  }
+  temp_file="$(mktemp "$CONFIG_DIR/port-forward.conf.XXXXXX")"
+  removed=false
+  while IFS=$'\t' read -r config_namespace config_deployment config_ports; do
+    if [[ "$config_namespace" == "$namespace" && "$config_deployment" == "$deployment" ]]; then
+      removed=true
+      continue
+    fi
+    printf '%s\t%s\t%s\n' "$config_namespace" "$config_deployment" "$config_ports" >>"$temp_file"
+  done <"$CONFIG_FILE"
+  chmod 0600 "$temp_file"
+  mv -f "$temp_file" "$CONFIG_FILE"
+  if [[ "$removed" == true ]]; then
+    printf 'Usunieto konfiguracje dla %s/%s.\n' "$namespace" "$deployment"
+  else
+    printf 'Brak zapisanej konfiguracji dla %s/%s.\n' "$namespace" "$deployment"
+  fi
+}
 
 is_running() {
   [[ -s "$PID_FILE" ]] && kill -0 "$(cat "$PID_FILE")" 2>/dev/null
@@ -79,12 +147,53 @@ parse_target_and_ports() {
   select_codex_target "$requested_namespace" "$requested_deployment"
 }
 
+configure_ports() {
+  operation="${1:-list}"
+  shift || true
+  case "$operation" in
+    list)
+      (($# == 0)) || { printf 'ERROR: config list nie przyjmuje argumentow.\n' >&2; exit 2; }
+      list_configurations
+      ;;
+    set)
+      parse_target_and_ports "$@"
+      ((${#ports[@]} > 0)) || {
+        printf 'ERROR: config set wymaga co najmniej jednego PORT:PORT.\n' >&2
+        exit 2
+      }
+      save_configuration "$CODEX_NAMESPACE" "$CODEX_DEPLOYMENT" "${ports[@]}"
+      ;;
+    remove)
+      parse_target_and_ports "$@"
+      ((${#ports[@]} == 0)) || {
+        printf 'ERROR: config remove nie przyjmuje portow.\n' >&2
+        exit 2
+      }
+      remove_configuration "$CODEX_NAMESPACE" "$CODEX_DEPLOYMENT"
+      ;;
+    *)
+      printf 'ERROR: Uzycie: %s config {list|set|remove}.\n' "$0" >&2
+      exit 2
+      ;;
+  esac
+}
+
 case "${1:-start}" in
   --worker)
     worker "$@"
     ;;
   list)
     print_codex_targets
+    ;;
+  config)
+    shift
+    command -v kubectl >/dev/null 2>&1 || {
+      [[ "${1:-list}" == list ]] || {
+        printf 'ERROR: Brak kubectl. Polecenie uruchamiaj na hoscie Olares.\n' >&2
+        exit 1
+      }
+    }
+    configure_ports "$@"
     ;;
   start)
     shift || true
@@ -98,7 +207,18 @@ case "${1:-start}" in
       exit 0
     fi
     parse_target_and_ports "$@"
-    printf '%s/%s\n' "$CODEX_NAMESPACE" "$CODEX_DEPLOYMENT" >"$TARGET_FILE"
+    if ((${#ports[@]} == 0)); then
+      if load_configured_ports "$CODEX_NAMESPACE" "$CODEX_DEPLOYMENT"; then
+        ports=("${configured_ports[@]}")
+        printf 'Uzywam zapisanej konfiguracji portow: %s\n' "${ports[*]}"
+      else
+        ports=("${DEFAULT_PORTS[@]}")
+        printf 'Brak zapisanej konfiguracji; uzywam portow domyslnych: %s\n' "${ports[*]}"
+      fi
+    else
+      printf 'Uzywam portow podanych w poleceniu: %s\n' "${ports[*]}"
+    fi
+    printf '%s/%s %s\n' "$CODEX_NAMESPACE" "$CODEX_DEPLOYMENT" "${ports[*]}" >"$TARGET_FILE"
     nohup "$0" --worker "$CODEX_NAMESPACE" "$CODEX_DEPLOYMENT" "${ports[@]}" \
       >>"$LOG_FILE" 2>&1 &
     worker_pid=$!
@@ -136,7 +256,7 @@ case "${1:-start}" in
     exec tail -n 100 -f "$LOG_FILE"
     ;;
   *)
-    printf 'Uzycie: %s {list|start [--namespace NS] [--deployment NAME] [PORT:PORT...]|stop|status|logs}\n' \
+    printf 'Uzycie: %s {list|config {list|set|remove}|start [--namespace NS] [--deployment NAME] [PORT:PORT...]|stop|status|logs}\n' \
       "$0" >&2
     exit 2
     ;;

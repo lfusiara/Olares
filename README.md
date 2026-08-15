@@ -45,6 +45,44 @@ olares-ha-port-forward start \
   8123:8123 1883:1883 8100:8100
 ```
 
+### Porty zapisane osobno dla każdej instancji
+
+Zapisz konfigurację dla konkretnego Codex CLI:
+
+```bash
+olares-ha-port-forward config set \
+  --namespace NAMESPACE \
+  --deployment DEPLOYMENT \
+  8123:8123 1883:1883 8100:8100
+```
+
+Inna instancja może mieć własny zestaw i inne porty hosta:
+
+```bash
+olares-ha-port-forward config set \
+  --namespace DRUGI_NAMESPACE \
+  --deployment DRUGI_DEPLOYMENT \
+  18123:8123 11883:1883
+```
+
+Lista i usuwanie konfiguracji:
+
+```bash
+olares-ha-port-forward config list
+olares-ha-port-forward config remove \
+  --namespace NAMESPACE --deployment DEPLOYMENT
+```
+
+Po zapisaniu wystarczy:
+
+```bash
+olares-ha-port-forward start --namespace NAMESPACE --deployment DEPLOYMENT
+```
+
+Kolejność wyboru portów to: porty podane w `start`, zapisana konfiguracja dla
+instancji, a na końcu zestaw domyślny. Konfiguracja znajduje się w
+`~/.config/olares-toolbox/port-forward.conf` i ma uprawnienia `0600`.
+
 Obsługa:
 
 ```bash
